@@ -41,6 +41,7 @@ KOKORO_VOICE = "af_heart"
 
 STT_SR = 24000          # Kyutai STT operates at 24 kHz
 BLOCK = 1920            # 80 ms at 24 kHz, the frame size the model steps on
+FLUSH_BLOCKS = 16       # ~1.3s of trailing silence to drain the model's ~0.5s lookahead; tune per model
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("speech")
@@ -157,6 +158,8 @@ async def _stt_session(ws):
             elif t == "stop":
                 if len(buf) > 0:
                     in_q.put(np.pad(buf, (0, BLOCK - len(buf))))  # pad the trailing partial block
+                for _ in range(FLUSH_BLOCKS):  # drain the lookahead delay so the last words emit
+                    in_q.put(np.zeros(BLOCK, np.float32))
                 break
     finally:
         in_q.put(None)  # always release the worker, even if the socket dropped

@@ -23,11 +23,11 @@ URL = "ws://127.0.0.1:8765"
 SENTENCE = "The quick brown fox jumps over the lazy dog."
 
 
-async def tts(text: str, engine: str = "kyutai") -> tuple[bytes, int]:
-    """Return (concatenated s16le pcm, sample_rate)."""
+async def tts(text: str) -> tuple[bytes, int]:
+    """Return (concatenated s16le pcm, sample_rate). Needs a moshi-server at KYUTAI_TTS_URL."""
     chunks, sr = [], 24000
     async with websockets.connect(URL + "/tts", max_size=None) as ws:
-        await ws.send(json.dumps({"type": "start", "engine": engine}))
+        await ws.send(json.dumps({"type": "start"}))
         await ws.send(json.dumps({"type": "text", "text": text}))
         await ws.send(json.dumps({"type": "stop"}))
         async for msg in ws:
@@ -86,11 +86,10 @@ def read_wav_16k(path: str) -> bytes:
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wav", help="16 kHz mono s16le WAV for STT (default: reuse TTS output)")
-    ap.add_argument("--tts-engine", default="kyutai", choices=["kyutai", "kokoro"])
     args = ap.parse_args()
 
-    print(f"TTS ({args.tts_engine}): synthesizing...")
-    pcm, sr = await tts(SENTENCE, args.tts_engine)
+    print("TTS: synthesizing (needs a moshi-server at KYUTAI_TTS_URL)...")
+    pcm, sr = await tts(SENTENCE)
     write_wav("tts_out.wav", pcm, sr)
     print(f"TTS: wrote tts_out.wav ({len(pcm)//2} samples @ {sr} Hz)")
 

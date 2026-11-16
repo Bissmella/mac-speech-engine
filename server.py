@@ -2,24 +2,27 @@
 
 /stt  Kyutai STT (streaming). Resamples the 16 kHz wire input to 24 kHz, feeds
       80 ms blocks, emits `partial` frames live and one `final` on stop.
-/tts  Kyutai TTS by default, Kokoro as a fallback engine. Buffers text,
-      synthesizes on flush/stop, streams audio frames as produced.
+/tts  proxies a streaming moshi-server (Rust/Metal) so audio starts before the full
+      text arrives. Streams audio frames as produced.
 
 Localhost only, one connection = one session. See README.
 
-NOTE: ported from kyutai-labs/delayed-streams-modeling MLX scripts and pinned to
-moshi_mlx 0.2.12. The STT/TTS paths use that package's lower-level streaming API,
-so they are structural ports verified against the scripts, not run on this
-(non-macOS) machine. Expect to confirm the moshi_mlx version on first launch.
+NOTE: STT is a structural port of kyutai-labs/delayed-streams-modeling MLX scripts
+(moshi_mlx 0.2.12), verified against the scripts but not run on this (non-macOS)
+machine. Kyutai TTS uses moshi-server's /api/tts_streaming protocol (see the unmute
+repo). Confirm the moshi_mlx version and that moshi-server is reachable on first launch.
 """
 
 import asyncio
 import base64
 import json
 import logging
+import os
 import queue
 import threading
+import urllib.parse
 
+import msgpack
 import numpy as np
 import websockets
 
@@ -33,15 +36,19 @@ from moshi_mlx import models, utils
 HOST = "127.0.0.1"
 PORT = 8765
 
-STT_REPO = "kyutai/stt-1b-en_fr-mlx"          # 1B, 0.5s delay (low latency); 2.6b-en is 2.5s
-DEFAULT_TTS_ENGINE = "kyutai"                 # "kyutai" or "kokoro"
-KYUTAI_TTS_VOICE = "expresso/ex03-ex01_happy_001_channel1_334s.wav"
-KOKORO_MODEL = "mlx-community/Kokoro-82M-bf16"
-KOKORO_VOICE = "af_heart"
+STT_REPO = "kyutai/stt-2.6b-en-mlx"           # 2.6B English, ~2.5s delay (more accurate); 1b-en_fr is 0.5s
+
+# TTS streams from a separate moshi-server (Rust/Metal). Run one and point KYUTAI_TTS_URL
+# at it; "public_token" is moshi-server's default dev key.
+KYUTAI_TTS_URL = os.environ.get("KYUTAI_TTS_URL", "ws://127.0.0.1:8089")
+KYUTAI_TTS_API_KEY = os.environ.get("KYUTAI_TTS_API_KEY", "public_token")
+TTS_STREAMING_PATH = "/api/tts_streaming"
+TTS_CFG_ALPHA = 1.5
+MOSHI_SR = 24000          # moshi-server emits 24 kHz float PCM
 
 STT_SR = 24000          # Kyutai STT operates at 24 kHz
 BLOCK = 1920            # 80 ms at 24 kHz, the frame size the model steps on
-FLUSH_BLOCKS = 16       # ~1.3s of trailing silence to drain the model's ~0.5s lookahead; tune per model
+FLUSH_BLOCKS = 40       # ~3.2s of trailing silence to drain the 2.6b model's ~2.5s lookahead; tune per model
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("speech")
@@ -51,8 +58,6 @@ log = logging.getLogger("speech")
 _mlx_lock = threading.Lock()
 
 _STT = None          # loaded at startup
-_kyutai_tts = None   # lazy
-_kokoro = None       # lazy
 
 
 # --- helpers -----------------------------------------------------------------
@@ -139,6 +144,7 @@ async def _stt_session(ws):
 
     worker_task = asyncio.create_task(asyncio.to_thread(worker))
     buf = np.zeros(0, np.float32)
+    received = 0  # STT_SR samples fed, for a quick "did we actually get audio?" log
     try:
         async for msg in ws:
             data = json.loads(msg)
@@ -147,7 +153,9 @@ async def _stt_session(ws):
                 buf = np.zeros(0, np.float32)
             elif t == "audio":
                 pcm = np.frombuffer(base64.b64decode(data["data"]), "<i2").astype(np.float32) / 32768.0
-                buf = np.concatenate([buf, _resample(pcm, 16000, STT_SR)])
+                res = _resample(pcm, 16000, STT_SR)
+                received += len(res)
+                buf = np.concatenate([buf, res])
                 while len(buf) >= BLOCK:
                     in_q.put(buf[:BLOCK].copy())
                     buf = buf[BLOCK:]
@@ -156,6 +164,7 @@ async def _stt_session(ws):
                     if kind == "partial":
                         await ws.send(json.dumps({"type": "partial", "text": txt.strip()}))
             elif t == "stop":
+                log.info("STT stop: %.2fs of audio received", received / STT_SR)
                 if len(buf) > 0:
                     in_q.put(np.pad(buf, (0, BLOCK - len(buf))))  # pad the trailing partial block
                 for _ in range(FLUSH_BLOCKS):  # drain the lookahead delay so the last words emit
@@ -169,127 +178,70 @@ async def _stt_session(ws):
     while not out_q.empty():
         kind, txt = out_q.get_nowait()
         final_text = txt
+    log.info("STT final: %r", final_text.strip())
     await ws.send(json.dumps({"type": "final", "text": final_text.strip()}))
 
 
-# --- TTS (Kyutai + Kokoro) ---------------------------------------------------
+# --- TTS ---------------------------------------------------------------------
+# Kyutai TTS streams text->audio only through Kyutai's moshi-server (Rust/Metal); the
+# in-process moshi_mlx TTS API is whole-script. So /tts just bridges a running
+# moshi-server, translating our JSON <-> its msgpack.
 
-def _load_kyutai_tts() -> dict:
-    from moshi_mlx.models.tts import DEFAULT_DSM_TTS_REPO, DEFAULT_DSM_TTS_VOICE_REPO, TTSModel
-    from moshi_mlx.utils.loaders import hf_get
+async def _tts_proxy_kyutai(ws, voice: str | None):
+    """Bridge one /tts session to a streaming moshi-server: our JSON <-> its msgpack.
+    Text flows up as it arrives and audio streams back before the full text is known."""
+    params = {"format": "PcmMessagePack", "cfg_alpha": TTS_CFG_ALPHA}
+    if voice:
+        params["voice"] = voice
+    url = f"{KYUTAI_TTS_URL}{TTS_STREAMING_PATH}?{urllib.parse.urlencode(params)}"
+    headers = {"kyutai-api-key": KYUTAI_TTS_API_KEY}
 
-    raw = hf_get("config.json", DEFAULT_DSM_TTS_REPO)
-    with open(hf_get(raw)) as f:
-        raw = json.load(f)
-    mimi_weights = hf_get(raw["mimi_name"], DEFAULT_DSM_TTS_REPO)
-    moshi_weights = hf_get(raw.get("moshi_name", "model.safetensors"), DEFAULT_DSM_TTS_REPO)
-    tokenizer = hf_get(raw["tokenizer_name"], DEFAULT_DSM_TTS_REPO)
+    async with websockets.connect(url, additional_headers=headers, max_size=None) as up:
+        async for raw in up:  # handshake: server sends Ready (and may replay stale frames) first
+            m = msgpack.unpackb(raw)
+            if m.get("type") == "Ready":
+                break
+            if m.get("type") == "Error":
+                raise RuntimeError(f"moshi-server TTS error: {m.get('message')}")
 
-    lm_config = models.LmConfig.from_config_dict(raw)
-    lm_config.transformer.max_seq_len = lm_config.transformer.context  # moshi_mlx<=0.3.0 ring-cache workaround
-    model = models.Lm(lm_config)
-    model.set_dtype(mx.bfloat16)
-    model.load_pytorch_weights(str(moshi_weights), lm_config, strict=True)
+        async def uplink():
+            # Forward words as they arrive; Eos ends the turn. If our client closes first
+            # (barge-in), the finally still sends Eos so the server's turn ends.
+            try:
+                async for raw in ws:
+                    data = json.loads(raw)
+                    t = data.get("type")
+                    if t == "text":
+                        await up.send(msgpack.packb({"type": "Text", "text": data.get("text", "")}))
+                    elif t == "stop":
+                        break
+                    # "flush" is a no-op: the server streams continuously
+            finally:
+                try:
+                    await up.send(msgpack.packb({"type": "Eos"}))
+                except Exception:
+                    pass
 
-    text_tok = sentencepiece.SentencePieceProcessor(str(tokenizer))
-    audio_tok = models.mimi.Mimi(models.mimi_202407(lm_config.generated_codebooks))
-    audio_tok.load_pytorch_weights(str(mimi_weights), strict=True)
-
-    tts = TTSModel(model, audio_tok, text_tok, voice_repo=DEFAULT_DSM_TTS_VOICE_REPO,
-                   temp=0.6, cfg_coef=1, max_padding=8, initial_padding=2,
-                   final_padding=2, padding_bonus=0, raw_config=raw)
-    if tts.valid_cfg_conditionings:
-        cfg_cond = tts.cfg_coef
-        tts.cfg_coef = 1.0
-        no_text = no_prefix = False
-    else:
-        cfg_cond = None
-        no_text = no_prefix = True
-    return {"tts": tts, "cfg_cond": cfg_cond, "no_text": no_text, "no_prefix": no_prefix}
-
-
-def _get_kyutai_tts() -> dict:
-    global _kyutai_tts
-    if _kyutai_tts is None:
-        log.info("loading Kyutai TTS...")
-        _kyutai_tts = _load_kyutai_tts()
-    return _kyutai_tts
-
-
-def _get_kokoro():
-    global _kokoro
-    if _kokoro is None:
-        log.info("loading Kokoro TTS...")
-        from mlx_audio.tts.utils import load_model
-        _kokoro = load_model(KOKORO_MODEL)
-    return _kokoro
-
-
-def _synth(engine: str, text: str, voice: str | None, emit):
-    """Synthesize `text`, calling emit(float32_samples, sample_rate) per produced chunk."""
-    with _mlx_lock:
-        if engine == "kokoro":
-            v = voice or KOKORO_VOICE
-            for r in _get_kokoro().generate(text=text, voice=v, speed=1.0, lang_code=v[0]):
-                emit(np.asarray(r.audio, dtype=np.float32), int(getattr(r, "sample_rate", 24000)))
-            return
-
-        k = _get_kyutai_tts()
-        tts = k["tts"]
-        entries = [tts.prepare_script([text])]
-        voices = [tts.get_voice_path(voice or KYUTAI_TTS_VOICE)] if tts.multi_speaker else []
-        attrs = [tts.make_condition_attributes(voices, k["cfg_cond"])]
-        sr = int(tts.mimi.sample_rate)
-
-        def on_frame(frame):
-            if (frame == -1).any():
-                return
-            pcm = tts.mimi.decode_step(frame[:, :, None])
-            emit(np.array(mx.clip(pcm[0, 0], -1, 1), dtype=np.float32), sr)
-
-        tts.generate(entries, attrs, cfg_is_no_prefix=k["no_prefix"],
-                     cfg_is_no_text=k["no_text"], on_frame=on_frame)
+        up_task = asyncio.create_task(uplink())
+        try:
+            async for raw in up:  # audio streams back; the server closes once Eos is drained
+                m = msgpack.unpackb(raw)
+                if m.get("type") == "Audio":
+                    await ws.send(_audio_frame(np.asarray(m["pcm"], dtype=np.float32), MOSHI_SR))
+                elif m.get("type") == "Error":
+                    await ws.send(json.dumps({"type": "error", "message": str(m.get("message"))}))
+                    return
+        finally:
+            up_task.cancel()
+        await ws.send(json.dumps({"type": "final"}))
 
 
 async def _tts_session(ws):
-    buf: list[str] = []
-    voice = None
-    engine = DEFAULT_TTS_ENGINE
-    loop = asyncio.get_running_loop()
-
-    async def synth_buffered():
-        text = "".join(buf).strip()
-        buf.clear()
-        if not text:
-            return
-        q: asyncio.Queue = asyncio.Queue()
-        emit = lambda s, sr: loop.call_soon_threadsafe(q.put_nowait, (s, sr))
-
-        def produce():
-            try:
-                _synth(engine, text, voice, emit)
-            finally:
-                loop.call_soon_threadsafe(q.put_nowait, None)
-
-        worker = asyncio.create_task(asyncio.to_thread(produce))
-        while (item := await q.get()) is not None:
-            await ws.send(_audio_frame(*item))
-        await worker  # re-raise any synthesis error to the router
-
+    # The first frame is 'start'; everything after streams through the moshi-server proxy.
     async for msg in ws:
         data = json.loads(msg)
-        t = data.get("type")
-        if t == "start":
-            engine = (data.get("engine") or DEFAULT_TTS_ENGINE).lower()
-            voice = data.get("voice")  # None -> engine default
-            buf.clear()
-        elif t == "text":
-            buf.append(data["text"])
-        elif t == "flush":
-            await synth_buffered()
-        elif t == "stop":
-            await synth_buffered()
-            await ws.send(json.dumps({"type": "final"}))
+        if data.get("type") == "start":
+            await _tts_proxy_kyutai(ws, data.get("voice"))
             return
 
 
@@ -316,8 +268,7 @@ async def main():
     global _STT
     log.info("loading Kyutai STT (%s)...", STT_REPO)
     _STT = _load_stt()
-    _get_kyutai_tts()  # warm the default TTS engine; Kokoro stays lazy (fallback only)
-    log.info("models warm.")
+    log.info("STT warm. TTS streams from moshi-server at %s.", KYUTAI_TTS_URL)
     # max_size=None: base64 PCM frames exceed the 1 MB default; localhost, trusted.
     async with websockets.serve(router, HOST, PORT, max_size=None):
         log.info("listening on ws://%s:%d  (/stt, /tts)", HOST, PORT)

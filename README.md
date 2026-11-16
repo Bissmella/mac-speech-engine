@@ -48,12 +48,12 @@ It writes `tts_out.wav` (playable) and prints the live partials then the final t
 
 | | Model | Notes |
 |---|---|---|
-| STT | `kyutai/stt-2.6b-en-mlx` | 2.6B, English, ~2.5s delay, streaming. Input 16 kHz (resampled to 24 kHz internally) |
+| STT | `kyutai/stt-1b-en_fr-mlx` | 1B, English + French, ~0.5s delay, streaming, has a semantic VAD. Input 16 kHz (resampled to 24 kHz internally) |
 | TTS | Kyutai DSM TTS via **moshi-server** | 24 kHz mono, true text streaming. Bridges a moshi-server at `KYUTAI_TTS_URL` (default `ws://127.0.0.1:8089`) |
 
 The TTS `start` frame takes an optional `voice` (a moshi-server voice id; omit for
-the server default). Swap the STT model (e.g. to `kyutai/stt-1b-en_fr-mlx`, English
-+ French, lower latency but less accurate) by editing the constants at the top of
+the server default). Swap the STT model (e.g. to `kyutai/stt-2.6b-en-mlx`,
+English-only, more accurate but ~2.5s delay) by editing the constants at the top of
 `server.py` — remember to retune `FLUSH_BLOCKS` to the model's delay.
 
 ## Protocol

@@ -36,7 +36,7 @@ from moshi_mlx import models, utils
 HOST = "127.0.0.1"
 PORT = 8765
 
-STT_REPO = "kyutai/stt-2.6b-en-mlx"           # 2.6B English, ~2.5s delay (more accurate); 1b-en_fr is 0.5s
+STT_REPO = "kyutai/stt-1b-en_fr-mlx"          # 1B en+fr, ~0.5s delay + semantic VAD; 2.6b-en is 2.5s
 
 # TTS streams from a separate moshi-server (Rust/Metal). Run one and point KYUTAI_TTS_URL
 # at it; "public_token" is moshi-server's default dev key.
@@ -48,7 +48,7 @@ MOSHI_SR = 24000          # moshi-server emits 24 kHz float PCM
 
 STT_SR = 24000          # Kyutai STT operates at 24 kHz
 BLOCK = 1920            # 80 ms at 24 kHz, the frame size the model steps on
-FLUSH_BLOCKS = 40       # ~3.2s of trailing silence to drain the 2.6b model's ~2.5s lookahead; tune per model
+FLUSH_BLOCKS = 16       # ~1.3s of trailing silence to drain the 1b model's ~0.5s lookahead; tune per model
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("speech")

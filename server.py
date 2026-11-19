@@ -2,27 +2,24 @@
 
 /stt  Kyutai STT (streaming). Resamples the 16 kHz wire input to 24 kHz, feeds
       80 ms blocks, emits `partial` frames live and one `final` on stop.
-/tts  proxies a streaming moshi-server (Rust/Metal) so audio starts before the full
-      text arrives. Streams audio frames as produced.
+/tts  Kokoro TTS (MLX). Synthesizes buffered text on flush/stop and streams PCM.
 
 Localhost only, one connection = one session. See README.
 
-NOTE: STT is a structural port of kyutai-labs/delayed-streams-modeling MLX scripts
-(moshi_mlx 0.2.12), verified against the scripts but not run on this (non-macOS)
-machine. Kyutai TTS uses moshi-server's /api/tts_streaming protocol (see the unmute
-repo). Confirm the moshi_mlx version and that moshi-server is reachable on first launch.
+STT uses moshi_mlx 0.2.12. STT and TTS require Apple Silicon with MLX.
 """
 
 import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import queue
+import re
 import threading
-import urllib.parse
+import time
 
-import msgpack
 import numpy as np
 import websockets
 
@@ -38,13 +35,15 @@ PORT = 8765
 
 STT_REPO = "kyutai/stt-1b-en_fr-mlx"          # 1B en+fr, ~0.5s delay + semantic VAD; 2.6b-en is 2.5s
 
-# TTS streams from a separate moshi-server (Rust/Metal). Run one and point KYUTAI_TTS_URL
-# at it; "public_token" is moshi-server's default dev key.
-KYUTAI_TTS_URL = os.environ.get("KYUTAI_TTS_URL", "ws://127.0.0.1:8089")
-KYUTAI_TTS_API_KEY = os.environ.get("KYUTAI_TTS_API_KEY", "public_token")
-TTS_STREAMING_PATH = "/api/tts_streaming"
-TTS_CFG_ALPHA = 1.5
-MOSHI_SR = 24000          # moshi-server emits 24 kHz float PCM
+KOKORO_MODEL = "mlx-community/Kokoro-82M-bf16"
+KOKORO_VOICE = "af_heart"
+KOKORO_SPEED = float(os.environ.get("KOKORO_SPEED", "1.25"))
+if not math.isfinite(KOKORO_SPEED) or KOKORO_SPEED <= 0:
+    raise ValueError("KOKORO_SPEED must be a finite number greater than zero.")
+TTS_MIN_CLAUSE_CHARS = 80
+TTS_MAX_BUFFER_CHARS = 160
+TTS_SENTENCE_END = re.compile(r"""[.!?]["')\]]*\s+""")
+TTS_CLAUSE_END = re.compile(r"[,;:]\s+")
 
 STT_SR = 24000          # Kyutai STT operates at 24 kHz
 BLOCK = 1920            # 80 ms at 24 kHz, the frame size the model steps on
@@ -58,6 +57,7 @@ log = logging.getLogger("speech")
 _mlx_lock = threading.Lock()
 
 _STT = None          # loaded at startup
+_kokoro = None       # loaded on first TTS request
 
 
 # --- helpers -----------------------------------------------------------------
@@ -182,66 +182,116 @@ async def _stt_session(ws):
     await ws.send(json.dumps({"type": "final", "text": final_text.strip()}))
 
 
-# --- TTS ---------------------------------------------------------------------
-# Kyutai TTS streams text->audio only through Kyutai's moshi-server (Rust/Metal); the
-# in-process moshi_mlx TTS API is whole-script. So /tts just bridges a running
-# moshi-server, translating our JSON <-> its msgpack.
+# --- TTS (Kokoro) ------------------------------------------------------------
 
-async def _tts_proxy_kyutai(ws, voice: str | None):
-    """Bridge one /tts session to a streaming moshi-server: our JSON <-> its msgpack.
-    Text flows up as it arrives and audio streams back before the full text is known."""
-    params = {"format": "PcmMessagePack", "cfg_alpha": TTS_CFG_ALPHA}
-    if voice:
-        params["voice"] = voice
-    url = f"{KYUTAI_TTS_URL}{TTS_STREAMING_PATH}?{urllib.parse.urlencode(params)}"
-    headers = {"kyutai-api-key": KYUTAI_TTS_API_KEY}
+def _get_kokoro():
+    global _kokoro
+    if _kokoro is None:
+        from mlx_audio.tts.utils import load_model
 
-    async with websockets.connect(url, additional_headers=headers, max_size=None) as up:
-        async for raw in up:  # handshake: server sends Ready (and may replay stale frames) first
-            m = msgpack.unpackb(raw)
-            if m.get("type") == "Ready":
-                break
-            if m.get("type") == "Error":
-                raise RuntimeError(f"moshi-server TTS error: {m.get('message')}")
+        log.info("loading Kokoro TTS (%s)...", KOKORO_MODEL)
+        _kokoro = load_model(KOKORO_MODEL)
+    return _kokoro
 
-        async def uplink():
-            # Forward words as they arrive; Eos ends the turn. If our client closes first
-            # (barge-in), the finally still sends Eos so the server's turn ends.
-            try:
-                async for raw in ws:
-                    data = json.loads(raw)
-                    t = data.get("type")
-                    if t == "text":
-                        await up.send(msgpack.packb({"type": "Text", "text": data.get("text", "")}))
-                    elif t == "stop":
-                        break
-                    # "flush" is a no-op: the server streams continuously
-            finally:
-                try:
-                    await up.send(msgpack.packb({"type": "Eos"}))
-                except Exception:
-                    pass
 
-        up_task = asyncio.create_task(uplink())
-        try:
-            async for raw in up:  # audio streams back; the server closes once Eos is drained
-                m = msgpack.unpackb(raw)
-                if m.get("type") == "Audio":
-                    await ws.send(_audio_frame(np.asarray(m["pcm"], dtype=np.float32), MOSHI_SR))
-                elif m.get("type") == "Error":
-                    await ws.send(json.dumps({"type": "error", "message": str(m.get("message"))}))
-                    return
-        finally:
-            up_task.cancel()
-        await ws.send(json.dumps({"type": "final"}))
+def _synth(text: str, voice: str | None, emit):
+    """Synthesize text locally, emitting Kokoro's generated audio segments."""
+    with _mlx_lock:
+        model = _get_kokoro()
+        audio_seconds = 0.0
+        voice_id = voice or KOKORO_VOICE
+        started = time.perf_counter()
+        for result in model.generate(
+            text=text, voice=voice_id, speed=KOKORO_SPEED, lang_code=voice_id[0],
+        ):
+            samples = np.array(result.audio, dtype=np.float32, copy=True)
+            sample_rate = int(getattr(result, "sample_rate", 24000))
+            audio_seconds += samples.size / sample_rate
+            emit(samples, sample_rate)
+        elapsed = time.perf_counter() - started
+        if audio_seconds:
+            log.info(
+                "TTS generated %.2fs audio in %.2fs (%.2fx realtime)",
+                audio_seconds, elapsed, elapsed / audio_seconds,
+            )
+
+
+def _take_tts_chunks(text: str) -> tuple[list[str], str]:
+    """Take completed sentences or longer clauses from buffered text."""
+    chunks = []
+    while text:
+        sentence_end = TTS_SENTENCE_END.search(text)
+        clause_end = TTS_CLAUSE_END.search(text)
+        boundaries = []
+        if sentence_end and sentence_end.end() <= TTS_MAX_BUFFER_CHARS:
+            boundaries.append(sentence_end.end())
+        if (
+            clause_end
+            and TTS_MIN_CLAUSE_CHARS <= clause_end.end() <= TTS_MAX_BUFFER_CHARS
+        ):
+            boundaries.append(clause_end.end())
+
+        if boundaries:
+            cut = min(boundaries)
+        elif len(text) > TTS_MAX_BUFFER_CHARS:
+            cut = text.rfind(" ", 0, TTS_MAX_BUFFER_CHARS + 1)
+            if cut <= 0:
+                cut = text.find(" ", TTS_MAX_BUFFER_CHARS)
+                if cut < 0:
+                    break
+            cut += 1
+        else:
+            break
+        chunks.append(text[:cut])
+        text = text[cut:]
+    return chunks, text
 
 
 async def _tts_session(ws):
-    # The first frame is 'start'; everything after streams through the moshi-server proxy.
+    buf: list[str] = []
+    voice = None
+    loop = asyncio.get_running_loop()
+
+    async def synth_text(text: str):
+        text = text.strip()
+        if not text:
+            return
+        q: asyncio.Queue = asyncio.Queue()
+        emit = lambda samples, sr: loop.call_soon_threadsafe(q.put_nowait, (samples, sr))
+
+        def produce():
+            try:
+                _synth(text, voice, emit)
+            finally:
+                loop.call_soon_threadsafe(q.put_nowait, None)
+
+        worker = asyncio.create_task(asyncio.to_thread(produce))
+        while (item := await q.get()) is not None:
+            await ws.send(_audio_frame(*item))
+        await worker
+
+    async def synth_buffered():
+        text = "".join(buf)
+        buf.clear()
+        await synth_text(text)
+
     async for msg in ws:
         data = json.loads(msg)
-        if data.get("type") == "start":
-            await _tts_proxy_kyutai(ws, data.get("voice"))
+        t = data.get("type")
+        if t == "start":
+            voice = data.get("voice")
+            buf.clear()
+        elif t == "text":
+            buf.append(data.get("text", ""))
+            chunks, remainder = _take_tts_chunks("".join(buf))
+            buf[:] = [remainder]
+            for chunk in chunks:
+                await synth_text(chunk)
+        elif t == "flush":
+            await synth_buffered()
+        elif t == "stop":
+            await synth_buffered()
+            await ws.send(json.dumps({"type": "final"}))
             return
 
 
@@ -268,7 +318,10 @@ async def main():
     global _STT
     log.info("loading Kyutai STT (%s)...", STT_REPO)
     _STT = _load_stt()
-    log.info("STT warm. TTS streams from moshi-server at %s.", KYUTAI_TTS_URL)
+    log.info(
+        "STT warm. Kokoro TTS loads locally on first use (speed=%.2fx).",
+        KOKORO_SPEED,
+    )
     # max_size=None: base64 PCM frames exceed the 1 MB default; localhost, trusted.
     async with websockets.serve(router, HOST, PORT, max_size=None):
         log.info("listening on ws://%s:%d  (/stt, /tts)", HOST, PORT)

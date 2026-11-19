@@ -1,9 +1,8 @@
 # mac-speech-engine
 
-Local STT + TTS WebSocket server for Apple Silicon (MLX). Kyutai STT runs
-in-process for streaming speech-to-text. For streaming text-to-speech it bridges
-a separate Kyutai moshi-server. Localhost only, no auth. It's the server half of
-"Code Companion"; the VS Code extension is the client.
+Local STT + TTS WebSocket server for Apple Silicon (MLX). Kyutai STT and Kokoro
+TTS run in-process. Localhost only, no auth. It's the server half of "Code
+Companion"; the VS Code extension is the client.
 
 ## Requirements
 
@@ -16,7 +15,7 @@ a separate Kyutai moshi-server. Localhost only, no auth. It's the server half of
 pip install -r requirements.txt
 ```
 
-Models download from Hugging Face on first run (~6 GB total, cached after).
+Models download from Hugging Face as needed and are cached locally.
 
 ## Run
 
@@ -24,22 +23,19 @@ Models download from Hugging Face on first run (~6 GB total, cached after).
 python server.py        # loads STT, then listens on ws://127.0.0.1:8765
 ```
 
-Endpoints: `ws://127.0.0.1:8765/stt` and `/tts`. STT runs here; `/tts` bridges a moshi-server.
-
-### Streaming TTS needs a moshi-server
-
-`/tts` does not synthesize in-process — it bridges a Kyutai **moshi-server** that
-streams text in and audio out. Run one (see the `unmute` repo and kyutai-labs/moshi
-for the Rust `moshi-server` and a TTS config) and set `KYUTAI_TTS_URL` (default
-`ws://127.0.0.1:8089`). `/tts` is unavailable until that server is reachable.
+Endpoints: `ws://127.0.0.1:8765/stt` and `/tts`. TTS loads its model lazily on
+the first `/tts` request; no separate `moshi-server` process is needed. It starts
+synthesizing complete sentences and longer clauses as text arrives; unpunctuated
+text is split at about 160 characters. Its speaking rate defaults to `1.25x`; set
+`KOKORO_SPEED=1.50` before starting `server.py` to try `1.50x` instead.
 
 ## Acceptance check (no VS Code)
 
 With the server running, in another terminal:
 
 ```bash
-python test_client.py                      # TTS -> tts_out.wav, then STT it back (needs moshi-server)
-python test_client.py --wav recording.wav  # STT your own 16 kHz mono WAV (no moshi-server needed)
+python test_client.py                      # TTS -> tts_out.wav, then STT it back
+python test_client.py --wav recording.wav  # STT your own 16 kHz mono WAV
 ```
 
 It writes `tts_out.wav` (playable) and prints the live partials then the final transcript.
@@ -49,10 +45,10 @@ It writes `tts_out.wav` (playable) and prints the live partials then the final t
 | | Model | Notes |
 |---|---|---|
 | STT | `kyutai/stt-1b-en_fr-mlx` | 1B, English + French, ~0.5s delay, streaming, has a semantic VAD. Input 16 kHz (resampled to 24 kHz internally) |
-| TTS | Kyutai DSM TTS via **moshi-server** | 24 kHz mono, true text streaming. Bridges a moshi-server at `KYUTAI_TTS_URL` (default `ws://127.0.0.1:8089`) |
+| TTS | Kokoro (`mlx-community/Kokoro-82M-bf16`) | Local MLX inference, 24 kHz mono, default speed `1.25x`. The default voice is `af_heart`. |
 
-The TTS `start` frame takes an optional `voice` (a moshi-server voice id; omit for
-the server default). Swap the STT model (e.g. to `kyutai/stt-2.6b-en-mlx`,
+The TTS `start` frame takes an optional Kokoro voice id (e.g. `af_heart`; omit
+for the default). Swap the STT model (e.g. to `kyutai/stt-2.6b-en-mlx`,
 English-only, more accurate but ~2.5s delay) by editing the constants at the top of
 `server.py` — remember to retune `FLUSH_BLOCKS` to the model's delay.
 
@@ -66,17 +62,16 @@ little-endian, mono.
 zero or more `partial` (`text`) as you speak, then one `final` (`text`), or `error`.
 
 **TTS** `/tts` — client sends `start` (optional `voice`), repeated `text`, then
-`stop`. The server bridges a moshi-server that streams `audio` frames (`data`,
-`sample_rate`, `format`) as text arrives, ending with `final`, or `error`.
+optional `flush` frames to synthesize buffered text or `stop` to synthesize any
+remaining text and end the session. The server synthesizes complete sentences
+and longer clauses as text arrives, streams `audio` frames (`data`, `sample_rate`,
+`format`) as the local model generates them, then ends with `final` or `error`.
 
 ## Status
 
 STT is a port of Kyutai's MLX reference (`delayed-streams-modeling`,
-`moshi_mlx==0.2.12`), mirroring the upstream API but authored on Windows and not
-run on MLX — confirm the version and run the acceptance check on your Mac.
-TTS depends on a reachable moshi-server (`/api/tts_streaming`, the same protocol
-`unmute` uses); it is a thin bridge, verified against unmute's client but not run
-here.
+`moshi_mlx==0.2.12`). TTS uses MLX Audio's Kokoro model. Both need an Apple
+Silicon Mac with MLX; model weights download from Hugging Face on demand.
 
 ## Out of scope
 

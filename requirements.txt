@@ -1,7 +1,9 @@
 moshi_mlx==0.2.12
+mlx-audio==0.2.9
+misaki[en]>=0.8.2
+loguru>=0.7.3
 rustymimi
 sentencepiece
 huggingface_hub
-msgpack
 numpy
 websockets>=13

@@ -24,7 +24,7 @@ SENTENCE = "The quick brown fox jumps over the lazy dog."
 
 
 async def tts(text: str) -> tuple[bytes, int]:
-    """Return (concatenated s16le pcm, sample_rate). Needs a moshi-server at KYUTAI_TTS_URL."""
+    """Return (concatenated s16le PCM, sample rate) from the local TTS endpoint."""
     chunks, sr = [], 24000
     async with websockets.connect(URL + "/tts", max_size=None) as ws:
         await ws.send(json.dumps({"type": "start"}))
@@ -69,7 +69,7 @@ def write_wav(path: str, pcm: bytes, sr: int):
 
 
 def resample_s16le(pcm: bytes, src_sr: int, dst_sr: int) -> bytes:
-    """Linear resample; good enough to feed Whisper for the acceptance check."""
+    """Linear resample; good enough to feed the STT model for the acceptance check."""
     x = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
     n = int(len(x) * dst_sr / src_sr)
     y = np.interp(np.linspace(0, len(x), n, endpoint=False), np.arange(len(x)), x)
@@ -88,7 +88,7 @@ async def main():
     ap.add_argument("--wav", help="16 kHz mono s16le WAV for STT (default: reuse TTS output)")
     args = ap.parse_args()
 
-    print("TTS: synthesizing (needs a moshi-server at KYUTAI_TTS_URL)...")
+    print("TTS: synthesizing locally...")
     pcm, sr = await tts(SENTENCE)
     write_wav("tts_out.wav", pcm, sr)
     print(f"TTS: wrote tts_out.wav ({len(pcm)//2} samples @ {sr} Hz)")
